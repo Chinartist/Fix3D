@@ -168,3 +168,5 @@ tags
 wandb
 /inputs
 /outputs
+
+*.txt
