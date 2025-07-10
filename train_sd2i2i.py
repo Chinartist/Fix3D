@@ -30,20 +30,10 @@ from rich.progress import Progress,track, TextColumn, BarColumn, TaskProgressCol
 import warnings
 from accelerate.utils import get_active_deepspeed_plugin
 warnings.filterwarnings("ignore", category=UserWarning)
-from src.loss_utils import ssim
 import torch.nn as nn
 import tensorboard
 from torch.utils.tensorboard import SummaryWriter
-class codebook_utils():
-    def __init__(self,):
-        self.codebook_used = {}
-    def update(self, x):
-        for i in range(len(x)):
-            if i not in self.codebook_used:
-                self.codebook_used[i] = torch.zeros(x[i]["codebook_size"])
-            self.codebook_used[i][x[i]["min_encoding_indices"].detach().cpu().reshape(-1)]+=1
-    def get_utils(self):
-        return {k:(self.codebook_used[k]>100).sum()/len(self.codebook_used[k]) for k in self.codebook_used}
+
 def main(args):
     
     # fsdp_plugin = FullyShardedDataParallelPlugin(fsdp_version=2)
@@ -82,11 +72,8 @@ def main(args):
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "eval"), exist_ok=True)
 
-    dataset_train = RenderSRDataset(dataset_folder=args.dataset_folder,  split="train",)
+    dataset_train = RenderDataset(dataset_folder=args.dataset_folder,  split="train",)
     dl_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers)
-    dataset_val = RenderSRDataset(dataset_folder=args.dataset_folder, split="val")
-    dl_val = torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=True, num_workers=args.dataloader_num_workers)
-
     net_v2v = SD2I2I(pretrained_path=args.pretrained_path)
     net_v2v.set_train()
     if args.gradient_checkpointing:
@@ -190,10 +177,8 @@ def main(args):
     pbar.start()
     global_task = pbar.add_task("[green]Global steps", total=len(dl_train) * args.num_training_epochs)
     train_task = pbar.add_task("[red]Training...", total=len(dl_train))
-    val_task = pbar.add_task("[blue]Validation...", total=args.num_samples_eval)
     # start the training loop
     global_step = 0
-    CU = codebook_utils()
     lossG = torch.tensor(0).cuda()
     lossD_real = torch.tensor(0).cuda()
     lossD_fake = torch.tensor(0).cuda()
@@ -206,32 +191,29 @@ def main(args):
 
                 x_src = batch["x_src"]
                 x_tgt = batch["x_tgt"]
-                x_tgt_ram = ram_transforms(x_tgt*0.5+0.5)
-                caption = inference(x_tgt_ram.to(dtype=torch.float16), model_vlm)
-                batch["prompt"] = [f'{each_caption}' for each_caption in caption]
-                batch["negative_prompt"] = [args.neg_prompt for _ in range(len(batch["prompt"]))]
                 B, C, H, W = x_src.shape
+                batch["prompt"] = [f'' for _ in range(B)]
                 # forward pass
                 batch["x_src"] = batch["x_src"].cuda().to(weight_dtype)
                 batch["x_tgt"] = batch["x_tgt"].cuda().to(weight_dtype)
                 mask_rec = batch["mask_rec"].cuda().to(weight_dtype)
-                x_tgt_pred,latents_pred,latents_gt,extra_loss,quant_stats= net_v2v(batch)
-                if quant_stats is not None:
-                    CU.update(quant_stats)
-           
+                x_tgt_pred,latents_pred,latents_gt,extra_loss= net_v2v(batch)
+                
                 # # Reconstruction loss
                 if mask_rec.sum()>0:
                     loss_rec = F.mse_loss(x_tgt_pred[mask_rec>0],batch["x_tgt"][mask_rec>0], reduction="mean") * args.lambda_rec
-                    # loss_ssim = (1 - ssim(x_tgt_pred[mask_rec>0]*0.5+0.5, batch["x_tgt"][mask_rec>0]*0.5+0.5))* args.lambda_ssim
+              
                     loss_lpips = net_lpips(x_tgt_pred[mask_rec>0], batch["x_tgt"][mask_rec>0]).mean() * args.lambda_lpips
                     loss_depth,pred_depth,gt_depth = net_depth(x_tgt_pred[mask_rec>0], batch["x_tgt"][mask_rec>0]) 
                     loss_depth = loss_depth * args.lambda_depth
                     extra_loss["loss_rec"] = loss_rec
-                    # extra_loss["loss_ssim"] = loss_ssim
                     extra_loss["loss_lpips"] = loss_lpips
                     extra_loss["loss_depth"] = loss_depth   
                 
                 if args.lambda_vsd>0:
+                    caption = inference(ram_transforms(x_tgt*0.5+0.5).to(dtype=torch.float16), model_vlm)
+                    batch["prompt"] = [f'{each_caption}' for each_caption in caption]
+                    batch["negative_prompt"] = [f'{args.neg_prompt}' for _ in range(B)]
                     if torch.cuda.device_count() > 1:
                         prompt_embeds = net_reg.module.encode_prompt(batch["prompt"])
                         neg_prompt_embeds = net_reg.module.encode_prompt(batch["negative_prompt"])
@@ -301,10 +283,7 @@ def main(args):
                     # log all the losses
                     for k, v in extra_loss.items():
                         logs[k] = v.detach().item()
-                    if quant_stats is not None:
-                        codebook_used_info = CU.get_utils()
-                        for k in codebook_used_info:
-                            logs[f"codebook_used_{k}"] = codebook_used_info[k]
+                  
                     pbar.update(global_task, advance=1)
                     pbar.update(train_task, advance=1,description=f"[red]Epoch: {epoch:04d}")
                     # viz some images
@@ -315,58 +294,18 @@ def main(args):
                             "train/source": [wandb.Image(x_src[idx].float().detach().cpu()*0.5+0.5, caption=f"idx={idx}") for idx in range(B)],
                             "train/target": [wandb.Image(x_tgt[idx].float().detach().cpu()*0.5+0.5, caption=f"idx={idx}") for idx in range(B)],
                             "train/diff_pred": [wandb.Image(x_tgt_pred[idx].float().detach().cpu()*0.5+0.5, caption=f"idx={idx}") for idx in range(B)],
-                            # "train/gt_depth": [wandb.Image(gt_depth[idx], caption=f"idx={idx}") for idx in range(B)],
-                            # "train/pred_depth": [wandb.Image(pred_depth[idx], caption=f"idx={idx}") for idx in range(B)],
+                            "train/gt_depth": [wandb.Image(gt_depth[idx], caption=f"idx={idx}") for idx in range(B)],
+                            "train/pred_depth": [wandb.Image(pred_depth[idx], caption=f"idx={idx}") for idx in range(B)],
                         }
                         for k in log_dict:
                             logs[k] = log_dict[k]
 
                     # checkpoint the model
                     if global_step % args.checkpointing_steps == 10:
-                        outf = os.path.join(args.output_dir, "checkpoints", f"model_{global_step}.pkl")
+                        outf = os.path.join(args.output_dir, "checkpoints", f"model_{global_step}.pt")
                         accelerator.unwrap_model(net_v2v).save_model(outf)
                         accelerator.unwrap_model(net_disc).save_model(outf.replace("model", "model_disc"))
-                    # compute validation set FID, rec, LPIPS
-                    #save prompt
-                    # eval_prompt = []
-                    # if global_step % args.eval_freq == 1:
-                    #     l_rec, l_lpips = [], []
-                    #     for step, batch_val in enumerate(dl_val):
-                    #         if step >= args.num_samples_eval:
-                    #             break
-                    #         x_src = batch_val["x_src"].cuda()
-                    #         x_tgt = batch_val["x_tgt"].cuda()
-                    #         x_tgt_ram = ram_transforms(x_tgt*0.5+0.5)
-                    #         caption = inference(x_tgt_ram.to(dtype=torch.float16), model_vlm)
-                    #         batch_val["prompt"] = [f'{each_caption}' for each_caption in caption]
-                    #         eval_prompt+= batch_val["prompt"]                      
-                    #         B, C, H, W = x_src.shape
-                    #         assert B == 1, "Use batch size 1 for eval."
-                    #         batch_val["x_src"] = batch_val["x_src"].cuda().to(weight_dtype)
-                    #         batch_val["x_tgt"] = batch_val["x_tgt"].cuda().to(weight_dtype)
-                    #         with torch.no_grad():
-                    #             # forward pass
-                    #             x_tgt_pred= accelerator.unwrap_model(net_v2v).infer(batch_val)
-                    #             # compute the reconstruction losses
-                    #             loss_rec = F.l1_loss(x_tgt_pred, x_tgt, reduction="mean")
-                    #             loss_lpips = net_lpips(x_tgt_pred, x_tgt.float()).mean()
-          
-                    #             l_rec.append(loss_rec.item())
-                    #             l_lpips.append(loss_lpips.item())
-                                
-                    #             concate_img = torch.cat([(x_src* 0.5 + 0.5).clamp(0, 1), (x_tgt * 0.5 + 0.5).clamp(0, 1),(x_tgt_pred * 0.5 + 0.5).clamp(0, 1) ], dim=-2)
-                    #             concate_img = transforms.ToPILImage()(concate_img[0].cpu())
-                    #             os.makedirs(os.path.join(args.output_dir, "eval", "val_imgs"), exist_ok=True)
-                    #             outf = os.path.join(args.output_dir, "eval","val_imgs",f"val_{step}.png")
-                    #             concate_img.save(outf)
-                    #             pbar.update(val_task, advance=1)
-                    #     with open(os.path.join(args.output_dir, "eval", f"prompt.txt"), "w") as f:
-                    #         for i in range(len(eval_prompt)):
-                    #             f.write(f"{i}: {eval_prompt[i]}\n")
-                        
-                    #     pbar.reset(val_task)
-                    #     logs["val/rec"] = np.mean(l_rec)
-                    #     logs["val/lpips"] = np.mean(l_lpips)
+            
                  
                         gc.collect()
                         torch.cuda.empty_cache()

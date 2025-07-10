@@ -1,4 +1,6 @@
 import os
+import sys
+sys.path.append(os.path.dirname(__file__))
 import argparse
 import numpy as np
 from PIL import Image
@@ -22,38 +24,24 @@ def ocr_inpaint(src_img, target_img, result):
     return target_img
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_dir', type=str, default='/nvme0/public_data/Occupancy/proj/img2img-turbo/inputs/JiaLei', help='path to the input image')
+    parser.add_argument('--input_dir', type=str, default='/nvme0/public_data/Occupancy/proj/Fix3D/inputs/JiaLei', help='path to the input image')
     parser.add_argument('--prompt', type=str, default='', help='the prompt to be used')
     parser.add_argument('--num_cycle', type=int, default=1, )
-    parser.add_argument('--model_path', type=str, default='/nvme0/public_data/Occupancy/proj/img2img-turbo/outputs/pix2pix_turbo/stage0_render/checkpoints/mix_sd2.pkl', help='path to a model state dict to be used')
-    parser.add_argument('--output_dir', type=str, default='/nvme0/public_data/Occupancy/proj/img2img-turbo/inputs/JiaLei_post', help='the directory to save the output')
+    parser.add_argument('--model_path', type=str, default='/nvme0/public_data/Occupancy/proj/Fix3D/outputs/sd2i2i/stage1/checkpoints/model_2010.pt', help='path to a model state dict to be used')
+    parser.add_argument('--output_dir', type=str, default='/nvme0/public_data/Occupancy/proj/Fix3D/inputs/JiaLei_post', help='the directory to save the output')
     parser.add_argument('--max_size', type=int, default=1000, help='minimum size of the input image')
     parser.add_argument('--seed', type=int, default=42, help='Random seed to be used')
-    parser.add_argument('--use_fp16', type=bool, default=True, help='use fp16 for inference')
     args = parser.parse_args()
-    os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     torch.cuda.set_device(int(os.environ["CUDA_VISIBLE_DEVICES"]))
     os.makedirs(args.output_dir, exist_ok=True)
-    
-    ram_transforms = transforms.Compose([
-        transforms.Resize((384, 384)),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    model_vlm = ram(pretrained="/nvme0/public_data/Occupancy/proj/SeeSR/preset/models/ram_swin_large_14m.pth",
-            pretrained_condition="",
-            image_size=384,
-            vit='swin_l')
-    model_vlm.eval()
-    model_vlm.to("cuda", dtype=torch.float16)
     # initialize the model
     model = SD2I2I( pretrained_path=args.model_path)
-    model.vae.enable_tiling()
     engine = RapidOCR()
     model.set_eval()
     model.cuda()
-    if args.use_fp16:
-        model.half()
-
+    torch_dtype = torch.bfloat16 
+    model.to(torch_dtype)
     # make sure that the input image is a multiple of 8
     if args.input_dir == '':
         raise ValueError('input_dir should be provided')
@@ -62,8 +50,6 @@ if __name__ == "__main__":
     input_dir = args.input_dir
     device = int(os.environ["CUDA_VISIBLE_DEVICES"])
     for seg in track(os.listdir(input_dir)):
-        if "gt" in seg:
-            continue
         for input_image_path in tqdm(os.listdir(os.path.join(input_dir,seg))):
             input_image_path = os.path.join(input_dir,seg, input_image_path)
             if not os.path.isfile(input_image_path):
@@ -82,22 +68,14 @@ if __name__ == "__main__":
             bname = os.path.basename(input_image_path)
             x_src = F.to_tensor(input_image).unsqueeze(0).cuda()
             x_src = x_src * 2 - 1
-            if args.use_fp16:
-                x_src = x_src.half()
+            x_src = x_src.to(dtype=torch_dtype)
             output_image = x_src 
-            for _ in range(args.num_cycle):
-                with torch.no_grad():
-                    batch = {
-                        'x_src': output_image,
-                    }
-                    # batch["x_src"] =torch.nn.functional.interpolate(batch["x_src"], scale_factor=0.25, mode='bilinear', align_corners=False)
-                    # batch["x_src"] =torch.nn.functional.interpolate(batch["x_src"], scale_factor=4, mode='bilinear', align_corners=False)
-                    x_src_ram = ram_transforms(output_image*0.5+0.5)
-                    caption = inference(x_src_ram.to(dtype=torch.float16), model_vlm)
-                    batch["prompt"] = [f'' for each_caption in caption]
-                    # batch["prompt"] = [each_caption for each_caption in caption]
-                    print(batch["prompt"])
-                    output_image = model.infer(batch)
+            with torch.no_grad():
+                batch = {
+                    'x_src': output_image,
+                }
+                batch["prompt"] = [f'']
+                output_image = model.infer(batch)
             output_image = output_image* 0.5 + 0.5
             output_pil = output_image[0].cpu()*255
             output_pil = output_pil.permute(1, 2, 0).byte().numpy()

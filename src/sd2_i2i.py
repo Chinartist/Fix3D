@@ -27,45 +27,22 @@ from copy import deepcopy
 class SD2I2I(torch.nn.Module):
     def __init__(self,pretrained_path=None):
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained("stabilityai/sd-turbo", subfolder="tokenizer")
-        self.text_encoder = CLIPTextModel.from_pretrained("stabilityai/sd-turbo", subfolder="text_encoder").cuda()
-        self.scheduler =EulerDiscreteScheduler().from_pretrained("stabilityai/sd-turbo", subfolder="scheduler")
+        model_id = "/nvme0/public_data/Occupancy/proj/cache/stabilityai/sd-turbo"
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id, subfolder="tokenizer")
+        self.text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder")
+        self.scheduler =EulerDiscreteScheduler().from_pretrained(model_id, subfolder="scheduler")
         timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, 1, "cuda", None)
         assert len(timesteps) == 1
         self.timesteps = torch.tensor(timesteps).cuda()
         print(f"Num inference steps actual: {num_inference_steps}")
         print(f"First timestep: {timesteps[0]}")
-        vae:AutoencoderKL = AutoencoderKL.from_pretrained("stabilityai/sd-turbo", subfolder="vae")
-        unet:UNet2DConditionModel = UNet2DConditionModel.from_pretrained("stabilityai/sd-turbo", subfolder="unet")
+        vae:AutoencoderKL = AutoencoderKL.from_pretrained(model_id, subfolder="vae")
+        unet:UNet2DConditionModel = UNet2DConditionModel.from_pretrained("/nvme0/public_data/Occupancy/proj/cache/nvidia/difix", subfolder="unet")
         unet.enable_xformers_memory_efficient_attention()
-        if pretrained_path is not None:
+        if pretrained_path is not None and pretrained_path != "":
             print("Loading pretrained model from path:", pretrained_path)
             sd = torch.load(pretrained_path, map_location="cpu")
-            unet_lora_config = LoraConfig(r=sd['lora_config_unet']['r'],
-                lora_alpha=sd['lora_config_unet']['lora_alpha'],
-                target_modules=sd['lora_config_unet']['target_modules'],)
-            unet.add_adapter(unet_lora_config)
-            _sd_unet = unet.state_dict()
-            for k in sd["state_dict_unet"]:
-                _sd_unet[k] = sd["state_dict_unet"][k]
-            unet.load_state_dict(_sd_unet)
-            lora_config_unet=sd["lora_config_unet"]
-        elif  pretrained_path is None:
-            target_modules_unet = [
-                "to_k", "to_q", "to_v", "to_out.0", "conv", "conv1", "conv2", "conv_shortcut", "conv_out",
-                "proj_in", "proj_out", "ff.net.2", "ff.net.0.proj"
-            ]
-            unet_lora_config = LoraConfig(r=256, init_lora_weights="gaussian",
-                target_modules=target_modules_unet
-            )
-            unet.add_adapter(unet_lora_config)
-            lora_config_unet= dict(
-                r =unet_lora_config.r,
-                lora_alpha = unet_lora_config.lora_alpha,
-                target_modules = unet_lora_config.target_modules
-            )
-        print("Lora config for unet:", lora_config_unet)
-        self.lora_config_unet = lora_config_unet
+            unet.load_state_dict(sd["state_dict_unet"])
         self.unet, self.vae = unet, vae
         self.requires_grad_(False)
     
@@ -84,11 +61,12 @@ class SD2I2I(torch.nn.Module):
         self.scheduler._init_step_index(self.timesteps[0])
         image_pred = (self.vae.decode(sample_pred / self.vae.config.scaling_factor, return_dict=False, generator=None)[
                             0
-                        ]).clamp(-1, 1)
+                        ])
+        image_pred = image_pred+(image_pred.clamp(-1, 1)-image_pred).detach()
         loss ={}
         loss["loss_latent"]= F.mse_loss(sample_pred.detach(), sample)
         
-        return image_pred,sample_pred,sample,loss,None
+        return image_pred,sample_pred,sample,loss
     @torch.no_grad()
     def infer(self, batch):
         # either the prompt or the prompt_tokens should be provided
@@ -111,14 +89,11 @@ class SD2I2I(torch.nn.Module):
         
         return image_pred
     def set_eval(self):
-            self.eval()
-            self.requires_grad_(False)
+        self.eval()
+        self.requires_grad_(False)
     def set_train(self):
         self.train()
-        for n, _p in self.unet.named_parameters():
-            if "lora" in n:
-                _p.requires_grad = True
-        self.unet.conv_in.requires_grad_(True)
+        self.unet.requires_grad_(True)
     def encode_prompt(self, prompt_batch):
         prompt_embeds_list = []
         with torch.no_grad():
@@ -135,9 +110,7 @@ class SD2I2I(torch.nn.Module):
         return prompt_embeds
     def save_model(self, outf):
         sd = {}
-        sd["lora_config_unet"] = self.lora_config_unet
-        sd["state_dict_unet"] = {k: v for k, v in self.unet.state_dict().items() if "lora" in k or "conv_in" in k}
-
+        sd["state_dict_unet"] = {k: v for k, v in self.unet.state_dict().items()}
         torch.save(sd, outf)
 
 
@@ -145,7 +118,7 @@ class SD2I2I(torch.nn.Module):
 class SD2Reg(torch.nn.Module):
     def __init__(self, ):
         super().__init__() 
-
+        model_id = "stabilityai/stable-diffusion"
         self.tokenizer = AutoTokenizer.from_pretrained("stabilityai/stable-diffusion-2-1-base", subfolder="tokenizer")
         self.text_encoder = CLIPTextModel.from_pretrained("stabilityai/stable-diffusion-2-1-base", subfolder="text_encoder")
         self.noise_scheduler:PNDMScheduler = PNDMScheduler.from_pretrained("stabilityai/stable-diffusion-2-1-base", subfolder="scheduler")

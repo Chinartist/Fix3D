@@ -26,7 +26,6 @@ def parse_args_paired_training(input_args=None):
 
     parser.add_argument("--lambda_depth", default=1.0, type=float)
     parser.add_argument("--lambda_rec", default=1.0, type=float)
-    parser.add_argument("--lambda_ssim", default=0.5, type=float)
     #lambda_vsd
     parser.add_argument("--lambda_vsd", default=1.0, type=float)
 
@@ -68,8 +67,7 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of updates steps to accumulate before performing a backward/update pass.",)
     parser.add_argument("--gradient_checkpointing", action="store_true",)
     parser.add_argument("--learning_rate", type=float, default=5e-6)
-    #codebook_learning_rate
-    parser.add_argument("--codebook_learning_rate", type=float, default=1e-4)
+    
     parser.add_argument("--lr_scheduler", type=str, default="constant",
         help=(
             'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
@@ -127,144 +125,7 @@ def batch_random_crop(images, size):
         cropped_img = img[x:x + size[0], y:y + size[1], :]
         cropped_images.append(cropped_img)
     return cropped_images
-class RenderSRDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset_folder, split):
 
-        super().__init__()
-        gt_files  = os.path.join(dataset_folder, f"{split}_gt.txt")
-        render_files  = os.path.join(dataset_folder, f"{split}_render.txt")
-        with open (gt_files ,"r") as f:
-            gt_datafiles = f.read().splitlines()
-        with open (render_files ,"r") as f:
-            render_datafiles = f.read().splitlines()
-        self.render_datafiles =[x.strip() for x in render_datafiles if x.strip()]
-        self.gt_datafiles =[x.strip() for x in gt_datafiles if x.strip()]
-        self.ourscene_idx = []
-        if split=="train":
-            city_check = False
-            ours_check = False
-            nuscene_check = False
-            realcar_check = False
-            for i,gt in enumerate(self.gt_datafiles):
-                assert os.path.exists(gt), f"File {gt} does not exist"
-                if "Cityspaces" in gt:
-                    city_check = True
-                if "ourscene" in gt:
-                    if i < len(self.render_datafiles):
-                        self.ourscene_idx.append(i)
-                    ours_check = True
-                if "nuscene" in gt:
-                    nuscene_check = True
-                if "3DRealCar" in gt:
-                    realcar_check = True
-            # assert city_check or bdd_check, "The dataset should contain either city or bdd images"
-            print("City check:", city_check)
-            print("Ours check:", ours_check)
-            print("Nuscene check:", nuscene_check)
-            print("Realcar check:", realcar_check)
-            print("our scene:", len(self.ourscene_idx))
-
-        self.ft_rate = 0.5
-        self.hq2lq=A.Compose([
-            A.GaussianBlur(blur_limit=(3, 7), p=0.3),
-            A.MotionBlur(allow_shifted=False, p=0.3),
-            # A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.3),
-            # A.ChromaticAberration(primary_distortion_limit= (-0.3, 0.3),secondary_distortion_limit= (-0.3, 0.3),mode='random',p=0.3),
-            # A.Emboss(alpha=[0.5, 0.5], strength=[0.6, 0.7], p=0.3),
-        ],
-        )
-        self.randomresizepad = A.Compose([
-            A.Resize(256, 256, interpolation=cv2.INTER_LANCZOS4),
-            A.PadIfNeeded(min_height=512, min_width=512, border_mode=cv2.BORDER_CONSTANT, fill=255),
-        ],p=1.0)
-        self.downsample_range = [1, 12]
-    def __len__(self):
-        """
-        Returns:
-        int: The total number of items in the dataset.
-        """
-        return len(self.gt_datafiles)
-
-    def __getitem__(self, idx):
-        """
-        Retrieves a dataset item given its index. Each item consists of an input image, 
-        its corresponding output image, the captions associated with the input image, 
-        and the tokenized form of this caption.
-
-        This method performs the necessary preprocessing on both the input and output images, 
-        including scaling and normalization, as well as tokenizing the caption using a provided tokenizer.
-
-        Parameters:
-        - idx (int): The index of the item to retrieve.
-
-        Returns:
-        dict: A dictionary containing the following key-value pairs:
-            - "output_pixel_values": a tensor of the preprocessed output image with pixel values 
-            scaled to [-1, 1].
-            - "conditioning_pixel_values": a tensor of the preprocessed input image with pixel values 
-            scaled to [0, 1].
-            - "caption": the text caption.
-            - "input_ids": a tensor of the tokenized caption.
-
-        Note:
-        The actual preprocessing steps (scaling and normalization) for images are defined externally 
-        and passed to this class through the `image_prep` parameter during initialization. The 
-        tokenization process relies on the `tokenizer` also provided at initialization, which 
-        should be compatible with the models intended to be used with this dataset.
-        """
-        
-        caption=""
-        if "ourscene" not in self.gt_datafiles[idx] and  random.random() < self.ft_rate and len(self.ourscene_idx)>0:
-            idx = random.choice(self.ourscene_idx)
-        RandomScale =int(( random.random()*0.5+0.5)*1024)
-        RandomResize = transforms.Compose([
-            transforms.Resize(RandomScale, interpolation=transforms.InterpolationMode.LANCZOS),
-            # transforms.CenterCrop(512),
-        ])
-        x_tgt = np.array(RandomResize(Image.open(self.gt_datafiles[idx])))
-
-        if idx < len(self.render_datafiles):
-            x_src = np.array(RandomResize(Image.open(self.render_datafiles[idx])))
-            x_src, x_tgt = batch_random_crop([x_src, x_tgt], (512,512))
-            scale = np.random.uniform(1, 2)
-            w, h = x_src.shape[1], x_src.shape[0]
-            x_src =cv2.resize(x_src, (int(w/scale), int(h/scale)), interpolation=cv2.INTER_LANCZOS4)
-            x_src = cv2.resize(x_src, (int(w), int(h)), interpolation=cv2.INTER_LANCZOS4)
-        else:
-            x_tgt = batch_random_crop([x_tgt], (512,512))[0]
-            x_src = x_tgt
-            w, h = x_src.shape[1], x_src.shape[0]
-
-            x_src = self.hq2lq(image= x_src)['image']
-            scale = np.random.uniform(self.downsample_range[0], self.downsample_range[1])
-            x_src =cv2.resize(x_src, (int(w/scale), int(h/scale)), interpolation=cv2.INTER_LANCZOS4)
-            x_src = cv2.resize(x_src, (int(w), int(h)), interpolation=cv2.INTER_LANCZOS4)
-        if "3DRealCar" in self.gt_datafiles[idx] and  idx < len(self.render_datafiles):
-            car_scale = [ 128, 256,512]
-            random_car_scale = random.choice(car_scale)
-            randomresizepad = A.Compose([
-            A.Resize(random_car_scale, random_car_scale, interpolation=cv2.INTER_LANCZOS4),
-            A.PadIfNeeded(min_height=512, min_width=512, position="center",border_mode=cv2.BORDER_CONSTANT, fill=255),
-        ],p=1.0)
-            x_src = randomresizepad(image= x_src)['image']
-            x_tgt =randomresizepad(image= x_tgt)['image']
-        if random.random() > 0.5:
-            x_tgt = cv2.flip(x_tgt, 1)
-            x_src = cv2.flip(x_src, 1)
-        # input images scaled to -1,1
-        x_src = F.to_tensor(x_src)
-        x_src = F.normalize(x_src, mean=[0.5], std=[0.5])
-        # output images scaled to -1,1
-        x_tgt = F.to_tensor(x_tgt)
-        x_tgt = F.normalize(x_tgt, mean=[0.5], std=[0.5])
-        assert x_src.shape == x_tgt.shape, f"Image shapes do not match: {x_src.shape} vs {x_tgt.shape}"
-        # assert (x_src.shape[0], x_src.shape[1]) == (3, 512), f"Image shape is not (3, 512): {x_src.shape}"
-        mask_rec = np.array(1)
-        return {
-            "x_tgt": x_tgt,
-            "x_src": x_src,
-            "mask_rec":torch.from_numpy(mask_rec)
-        }
 
 class RenderDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_folder, split):
@@ -278,11 +139,6 @@ class RenderDataset(torch.utils.data.Dataset):
             render_datafiles = f.read().splitlines()
         self.render_datafiles =[x.strip() for x in render_datafiles if x.strip()]
         self.gt_datafiles =[x.strip() for x in gt_datafiles if x.strip()]
-        self.wogt_idx = []
-        if split=="train":
-            for i in range(len(self.render_datafiles)):
-                if i >= len(self.gt_datafiles):
-                    self.wogt_idx.append(i)
     def __len__(self):
         """
         Returns:
@@ -318,10 +174,7 @@ class RenderDataset(torch.utils.data.Dataset):
         should be compatible with the models intended to be used with this dataset.
         """
         
-        caption=""
-        # if   random.random() < 0.5  and idx < len(self.gt_datafiles):
-        #     idx = random.choice(self.wogt_idx)
-        RandomScale =int(( random.random()*0.5+0.5)*1024)
+        RandomScale =int(( random.random()*0.5+0.5)*1024)#512-1024
         RandomResize = transforms.Compose([
             transforms.Resize(RandomScale, interpolation=transforms.InterpolationMode.LANCZOS),
             # transforms.CenterCrop(512),
